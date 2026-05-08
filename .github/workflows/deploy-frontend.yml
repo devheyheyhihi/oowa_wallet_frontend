@@ -1,0 +1,91 @@
+name: deploy-frontend
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+      - ".gitignore"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Required Secrets
+        run: |
+          missing=0
+          require() { if [ -z "$1" ]; then echo "Missing $2"; missing=1; fi; }
+          require "${{ secrets.EC2_HOST }}"                              "EC2_HOST"
+          require "${{ secrets.EC2_USER }}"                              "EC2_USER"
+          require "${{ secrets.EC2_SSH_KEY }}"                           "EC2_SSH_KEY"
+          require "${{ secrets.EC2_FRONTEND_PATH }}"                     "EC2_FRONTEND_PATH"
+          require "${{ secrets.NEXT_PUBLIC_OOWA_BACKEND_API_BASE_URL }}" "NEXT_PUBLIC_OOWA_BACKEND_API_BASE_URL"
+          require "${{ secrets.NEXT_PUBLIC_KAKAO_MAP_API_KEY }}"         "NEXT_PUBLIC_KAKAO_MAP_API_KEY"
+          if [ "$missing" -ne 0 ]; then
+            echo "❌ Missing required secrets"
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_OOWA_BACKEND_API_BASE_URL: ${{ secrets.NEXT_PUBLIC_OOWA_BACKEND_API_BASE_URL }}
+          NEXT_PUBLIC_KAKAO_MAP_API_KEY: ${{ secrets.NEXT_PUBLIC_KAKAO_MAP_API_KEY }}
+        run: npm run build
+
+      - name: Package Standalone Build
+        run: |
+          rm -rf dist
+          mkdir -p dist/standalone
+          cp -R .next/standalone/. dist/standalone/
+          mkdir -p dist/standalone/.next
+          cp -R .next/static dist/standalone/.next/static
+          cp -R public dist/standalone/public
+          tar -czf frontend-standalone.tar.gz -C dist/standalone .
+
+      - name: Upload to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          source: "frontend-standalone.tar.gz"
+          target: "/tmp"
+
+      - name: Deploy and Restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.EC2_FRONTEND_PATH }}"
+            APP_DIR="$(echo "$APP_DIR" | tr -d '\r' | xargs)"
+            if [ -z "$APP_DIR" ] || [ "$APP_DIR" = "/" ] || [ "$APP_DIR" = "/home" ] || [ "$APP_DIR" = "/root" ]; then
+              echo "Invalid EC2_FRONTEND_PATH: '$APP_DIR'"
+              exit 1
+            fi
+            echo "Deploying to: $APP_DIR"
+            mkdir -p "$APP_DIR"
+            find "$APP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+            tar -xzf /tmp/frontend-standalone.tar.gz -C "$APP_DIR"
+            PORT=3000 pm2 start "$APP_DIR/server.js" --name oowa-frontend --update-env \
+              || pm2 restart oowa-frontend --update-env
+            pm2 save
